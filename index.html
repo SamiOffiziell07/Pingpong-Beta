@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+	<script>(function () {
+var parent = window.parent;
+if (!parent || parent === window) return;
+function send(action, content) {
+try {
+parent.postMessage({ action: action, content: content }, '*');
+} catch (e) {}
+}
+send('pageStarted');
+var contentShown = false;
+var contentSent = false;
+var contentVia = null;
+var parsed = false;
+var loaded = false;
+function usesSdk() {
+return !!document.querySelector('script[src*="/sdk/v1/rosebud.js"]');
+}
+function sendContent() {
+if (contentShown && parsed && !contentSent && (loaded || !usesSdk())) {
+contentSent = true;
+send('firstContent', { via: contentVia });
+}
+}
+function markContent(via) {
+if (contentShown) return;
+contentShown = true;
+contentVia = via;
+sendContent();
+}
+function markInnerFrame() {
+try {
+var frames = document.getElementsByTagName('iframe');
+var pageArea = window.innerWidth * window.innerHeight;
+for (var i = 0; i < frames.length; i++) {
+var box = frames[i].getBoundingClientRect();
+if (pageArea > 0 && box.width * box.height >= pageArea * 0.3) {
+markContent('frame');
+return;
+}
+}
+} catch (e) {}
+}
+document.addEventListener('DOMContentLoaded', function () {
+parsed = true;
+markInnerFrame();
+sendContent();
+});
+var paintTiming = false;
+try {
+paintTiming = PerformanceObserver.supportedEntryTypes.indexOf('paint') >= 0;
+if (paintTiming) {
+new PerformanceObserver(function (list) {
+var entries = list.getEntries();
+for (var i = 0; i < entries.length; i++) {
+if (entries[i].name === 'first-contentful-paint') markContent('paint');
+}
+}).observe({ type: 'paint', buffered: true });
+}
+} catch (e) {
+paintTiming = false;
+}
+var wrapped = [];
+function restoreDraws() {
+for (var i = 0; i < wrapped.length; i++) wrapped[i][0][wrapped[i][1]] = wrapped[i][2];
+wrapped = [];
+}
+var canvasDraws = [
+[window.WebGLRenderingContext, ['drawArrays', 'drawElements']],
+[window.WebGL2RenderingContext, ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced', 'drawRangeElements']],
+[window.CanvasRenderingContext2D, ['drawImage', 'fillText', 'strokeText', 'putImageData', 'stroke']]
+];
+for (var c = 0; c < canvasDraws.length; c++) {
+if (!canvasDraws[c][0] || !canvasDraws[c][0].prototype) continue;
+for (var d = 0; d < canvasDraws[c][1].length; d++) {
+(function (proto, name) {
+var original = proto[name];
+if (typeof original !== 'function') return;
+wrapped.push([proto, name, original]);
+proto[name] = function () {
+try {
+if (this.canvas && this.canvas.isConnected && this.canvas.getClientRects().length > 0) {
+restoreDraws();
+markContent('canvas');
+}
+} catch (e) {}
+return original.apply(this, arguments);
+};
+})(canvasDraws[c][0].prototype, canvasDraws[c][1][d]);
+}
+}
+window.addEventListener(
+'load',
+function () {
+loaded = true;
+send('runtimeLoaded');
+if (!paintTiming) markContent('load');
+sendContent();
+},
+{ once: true }
+);
+var master = 1;
+var gains = [];
+var playing = [];
+var media = null;
+var gameVolumes = null;
+var applied = null;
+var routed = null;
+var getVolume = null;
+var setVolume = null;
+var volumeLocked = false;
+var gameMuted = null;
+var appliedMuted = null;
+var getMuted = null;
+var setMuted = null;
+var spare = null;
+var own = null;
+function setGain(gain, value) {
+try {
+gain.gain.value = value === undefined ? master : value;
+} catch (e) {}
+}
+function liveGains() {
+var live = [];
+for (var i = 0; i < gains.length; i++) {
+if (gains[i].context.state !== 'closed') live.push(gains[i]);
+}
+gains = live;
+return live;
+}
+function addMasterGain(context) {
+var output = context.destination;
+var gain = context.createGain();
+setGain(gain);
+gain.connect(output);
+var forwarded = ['maxChannelCount', 'channelCount', 'channelCountMode', 'channelInterpretation'];
+for (var i = 0; i < forwarded.length; i++) {
+(function (name) {
+Object.defineProperty(gain, name, {
+configurable: true,
+get: function () {
+return output[name];
+},
+set: function (value) {
+output[name] = value;
+}
+});
+})(forwarded[i]);
+}
+gain.disconnect = function () {};
+Object.defineProperty(context, 'destination', {
+configurable: true,
+get: function () {
+return gain;
+}
+});
+liveGains().push(gain);
+}
+function isRouted(element) {
+return !!routed && routed.has(element);
+}
+function gameVolume(element) {
+var volume = gameVolumes.get(element);
+if (volume === undefined) {
+volume = getVolume.call(element);
+gameVolumes.set(element, volume);
+}
+return volume;
+}
+function playedScale(element) {
+return isRouted(element) ? 1 : master;
+}
+function isGameMuted(element) {
+var muted = gameMuted.get(element);
+if (muted === undefined) {
+muted = getMuted.call(element);
+gameMuted.set(element, muted);
+}
+return muted;
+}
+function applyVolume(element) {
+if (volumeLocked) {
+var path = own && own.routes.get(element);
+if (path) setGain(path.gain, gameVolume(element));
+var waiting = !!own && own.waiting.has(element);
+setMuted.call(element, isGameMuted(element) || playedScale(element) === 0 || waiting);
+appliedMuted.set(element, getMuted.call(element));
+} else {
+setVolume.call(element, gameVolume(element) * playedScale(element));
+applied.set(element, getVolume.call(element));
+}
+listen(element);
+}
+function checkedVolume(value) {
+if (!spare) spare = document.createElement('audio');
+setVolume.call(spare, value);
+return getVolume.call(spare);
+}
+function markRouted(element) {
+try {
+routed.set(element, true);
+if (media) applyVolume(element);
+} catch (e) {}
+}
+function controlsChangedVolume(element) {
+if (volumeLocked) return controlsChangedMuted(element);
+var played = getVolume.call(element);
+var last = applied.get(element);
+if (last === undefined) {
+if (gameVolumes.has(element)) gameVolumes.set(element, played);
+return;
+}
+if (Math.abs(played - last) < 1e-6) return;
+var scale = playedScale(element);
+gameVolumes.set(element, scale > 0 ? Math.min(1, played / scale) : played);
+applyVolume(element);
+}
+function controlsChangedMuted(element) {
+var muted = getMuted.call(element);
+var last = appliedMuted.get(element);
+if (last === undefined) {
+if (gameMuted.has(element)) gameMuted.set(element, muted);
+return;
+}
+if (muted === last) return;
+gameMuted.set(element, muted);
+applyVolume(element);
+}
+function onPlay(event) {
+try {
+if (event.target instanceof window.HTMLMediaElement) track(event.target);
+} catch (e) {}
+}
+function onVolumeChange(event) {
+try {
+if (event.target instanceof window.HTMLMediaElement) controlsChangedVolume(event.target);
+} catch (e) {}
+}
+function listen(target) {
+if (!target || typeof target.addEventListener !== 'function') return;
+target.addEventListener('play', onPlay, true);
+target.addEventListener('volumechange', onVolumeChange, true);
+if (own) target.addEventListener('loadstart', onLoadStart, true);
+}
+function track(element) {
+applyVolume(element);
+var still = [element];
+for (var i = 0; i < playing.length; i++) {
+if (playing[i] !== element && !playing[i].paused) still.push(playing[i]);
+}
+playing = still;
+if (!own) return;
+if (own.routes.has(element)) {
+wakeOwnContext(false);
+plug(element);
+} else if (canRoute(element)) {
+wakeOwnContext(true);
+if (wantsRoute(element)) routeSoon(element);
+}
+}
+function prepareSource(element, url) {
+if (!(element instanceof window.HTMLAudioElement)) return;
+own.readable.delete(element);
+var target = new window.URL(String(url), document.baseURI);
+var local = target.origin === window.location.origin;
+if (element.crossOrigin === null || own.cors.has(element)) {
+own.setCrossOrigin.call(element, local ? 'anonymous' : null);
+if (local) own.cors.set(element, true);
+else own.cors.delete(element);
+}
+var inline = target.protocol === 'data:' || target.protocol === 'blob:';
+own.readable.set(element, inline || element.crossOrigin !== null);
+}
+function onLoadStart(event) {
+try {
+var element = event.target;
+var url = element instanceof window.HTMLAudioElement && element.currentSrc;
+if (!url) return;
+var protocol = new window.URL(url).protocol;
+own.readable.set(element, protocol === 'data:' || protocol === 'blob:' || element.crossOrigin !== null);
+if (!element.paused && wantsRoute(element)) routeSoon(element);
+} catch (e) {}
+}
+function canRoute(element) {
+return (
+element instanceof window.HTMLAudioElement &&
+!isRouted(element) &&
+!own.tried.has(element) &&
+own.readable.get(element) === true
+);
+}
+function wantsRoute(element) {
+return master < 1 && canRoute(element);
+}
+function wakeOwnContext(create) {
+try {
+if (!own.context) {
+if (!create) return;
+own.context = new own.Context();
+own.context.addEventListener('statechange', routeWaiting);
+}
+if (own.context.state === 'running') return;
+var resumed = own.context.resume();
+if (resumed && typeof resumed.then === 'function') resumed.then(routeWaiting, function () {});
+} catch (e) {}
+}
+function onTap() {
+wakeOwnContext(false);
+}
+function routeWaiting() {
+for (var i = 0; i < playing.length; i++) {
+if (!playing[i].paused && wantsRoute(playing[i])) routeSoon(playing[i]);
+}
+}
+function routeSoon(element) {
+if (!own.context || own.context.state !== 'running' || own.waiting.has(element)) return;
+own.waiting.set(element, true);
+applyVolume(element);
+if (!element.paused && element.readyState >= 3) {
+routeLater(element);
+} else {
+element.addEventListener('playing', onPlaying);
+}
+}
+function onPlaying(event) {
+var element = event.target;
+try {
+element.removeEventListener('playing', onPlaying);
+} catch (e) {}
+routeLater(element);
+}
+function routeLater(element) {
+setTimeout(function () {
+try {
+route(element);
+} catch (e) {}
+}, 0);
+}
+function route(element) {
+own.waiting.delete(element);
+var source = null;
+try {
+if (own.context && own.context.state === 'running' && !element.paused && wantsRoute(element)) {
+own.tried.set(element, true);
+source = own.context.createMediaElementSource(element);
+}
+} catch (e) {}
+if (!source) return applyVolume(element);
+try {
+var gain = own.context.createGain();
+setGain(gain, gameVolume(element));
+own.routes.set(element, { source: source, gain: gain, plugged: false });
+element.addEventListener('pause', unplug);
+element.addEventListener('emptied', unplug);
+plug(element);
+} catch (e) {}
+}
+function plug(element) {
+var path = own.routes.get(element);
+if (!path || path.plugged) return;
+path.source.connect(path.gain);
+path.gain.connect(own.context.destination);
+path.plugged = true;
+}
+function unplug(event) {
+try {
+var element = event.target;
+var path = own.routes.get(element);
+if (!path || !path.plugged || !element.paused) return;
+path.source.disconnect();
+path.gain.disconnect();
+path.plugged = false;
+} catch (e) {}
+}
+function watchSources() {
+var setAttribute = media.setAttribute;
+if (typeof setAttribute === 'function') {
+media.setAttribute = function (name) {
+try {
+var key = String(name).toLowerCase();
+if (key === 'src') {
+prepareSource(this, arguments[1]);
+listen(this);
+} else if (key === 'crossorigin') own.cors.delete(this);
+} catch (e) {}
+return setAttribute.apply(this, arguments);
+};
+}
+var cloneNode = media.cloneNode;
+if (typeof cloneNode === 'function') {
+media.cloneNode = function () {
+var copy = cloneNode.apply(this, arguments);
+try {
+if (own.cors.has(this)) own.cors.set(copy, true);
+if (own.readable.has(this)) own.readable.set(copy, own.readable.get(this));
+listen(copy);
+} catch (e) {}
+return copy;
+};
+}
+var crossOrigin = Object.getOwnPropertyDescriptor(media, 'crossOrigin');
+Object.defineProperty(media, 'crossOrigin', {
+configurable: true,
+enumerable: crossOrigin.enumerable,
+get: crossOrigin.get,
+set: function (value) {
+try {
+own.cors.delete(this);
+} catch (e) {}
+crossOrigin.set.call(this, value);
+}
+});
+}
+function wrapAudio() {
+var Native = window.Audio;
+if (typeof Native !== 'function' || !Native.prototype) return;
+function RosebudAudio(src) {
+if (!(this instanceof RosebudAudio)) return Native.apply(this, arguments);
+var element =
+typeof Reflect === 'object' && Reflect.construct
+? Reflect.construct(Native, [], this.constructor)
+: new Native();
+if (src !== undefined) element.src = src;
+return element;
+}
+RosebudAudio.prototype = Native.prototype;
+try {
+if (Object.setPrototypeOf) Object.setPrototypeOf(RosebudAudio, Native);
+} catch (e) {}
+window.Audio = RosebudAudio;
+}
+var contextWrappers = [];
+function wrapAudioContext(name) {
+var Native = window[name];
+if (typeof Native !== 'function' || !Native.prototype) return;
+for (var i = 0; i < contextWrappers.length; i++) {
+if (contextWrappers[i][0] === Native) {
+window[name] = contextWrappers[i][1];
+return;
+}
+}
+function RosebudAudioContext() {
+if (!(this instanceof RosebudAudioContext)) return Native.apply(this, arguments);
+var context =
+typeof Reflect === 'object' && Reflect.construct
+? Reflect.construct(Native, arguments, this.constructor)
+: arguments.length
+? new Native(arguments[0])
+: new Native();
+try {
+addMasterGain(context);
+} catch (e) {}
+return context;
+}
+RosebudAudioContext.prototype = Native.prototype;
+try {
+if (Object.setPrototypeOf) Object.setPrototypeOf(RosebudAudioContext, Native);
+} catch (e) {}
+var createSource = Native.prototype.createMediaElementSource;
+if (typeof createSource === 'function' && routed) {
+Native.prototype.createMediaElementSource = function (element) {
+var node = createSource.apply(this, arguments);
+markRouted(element);
+return node;
+};
+}
+contextWrappers.push([Native, RosebudAudioContext]);
+window[name] = RosebudAudioContext;
+}
+function wrapMediaSourceNode() {
+var Native = window.MediaElementAudioSourceNode;
+if (typeof Native !== 'function' || !Native.prototype || !routed) return;
+function RosebudMediaElementAudioSourceNode(context, options) {
+if (!(this instanceof RosebudMediaElementAudioSourceNode)) return Native.apply(this, arguments);
+var node =
+typeof Reflect === 'object' && Reflect.construct
+? Reflect.construct(Native, arguments, this.constructor)
+: new Native(context, options);
+if (options) markRouted(options.mediaElement);
+return node;
+}
+RosebudMediaElementAudioSourceNode.prototype = Native.prototype;
+try {
+if (Object.setPrototypeOf) Object.setPrototypeOf(RosebudMediaElementAudioSourceNode, Native);
+} catch (e) {}
+window.MediaElementAudioSourceNode = RosebudMediaElementAudioSourceNode;
+}
+function applyMaster() {
+var live = liveGains();
+for (var i = 0; i < live.length; i++) setGain(live[i]);
+var still = [];
+for (var j = 0; j < playing.length; j++) {
+if (playing[j].paused) continue;
+still.push(playing[j]);
+try {
+applyVolume(playing[j]);
+} catch (e) {}
+}
+playing = still;
+if (own) routeWaiting();
+}
+try {
+if (typeof WeakMap === 'function') {
+gameVolumes = new WeakMap();
+applied = new WeakMap();
+routed = new WeakMap();
+gameMuted = new WeakMap();
+appliedMuted = new WeakMap();
+}
+wrapAudioContext('AudioContext');
+wrapAudioContext('webkitAudioContext');
+wrapMediaSourceNode();
+var mediaProto = window.HTMLMediaElement && window.HTMLMediaElement.prototype;
+var volumeDescriptor = mediaProto && Object.getOwnPropertyDescriptor(mediaProto, 'volume');
+if (gameVolumes && volumeDescriptor && volumeDescriptor.get && volumeDescriptor.set && volumeDescriptor.configurable) {
+media = mediaProto;
+getVolume = volumeDescriptor.get;
+setVolume = volumeDescriptor.set;
+var userAgent = (window.navigator && window.navigator.userAgent) || '';
+var mutedDescriptor = Object.getOwnPropertyDescriptor(media, 'muted');
+if (
+/\b(iPhone|iPod)\b/.test(userAgent) &&
+mutedDescriptor &&
+mutedDescriptor.get &&
+mutedDescriptor.set &&
+mutedDescriptor.configurable
+) {
+volumeLocked = true;
+getMuted = mutedDescriptor.get;
+setMuted = mutedDescriptor.set;
+Object.defineProperty(media, 'muted', {
+configurable: true,
+enumerable: mutedDescriptor.enumerable,
+get: function () {
+return isGameMuted(this);
+},
+set: function (value) {
+try {
+gameMuted.set(this, !!value);
+applyVolume(this);
+} catch (e) {
+setMuted.call(this, value);
+}
+}
+});
+var Context = window.AudioContext || window.webkitAudioContext;
+var crossOriginDescriptor = Object.getOwnPropertyDescriptor(media, 'crossOrigin');
+if (
+Context &&
+window.HTMLAudioElement &&
+window.URL &&
+window.location &&
+crossOriginDescriptor &&
+crossOriginDescriptor.set &&
+crossOriginDescriptor.configurable
+) {
+own = {
+Context: Context,
+context: null,
+setCrossOrigin: crossOriginDescriptor.set,
+cors: new WeakMap(),
+readable: new WeakMap(),
+waiting: new WeakMap(),
+tried: new WeakMap(),
+routes: new WeakMap()
+};
+watchSources();
+wrapAudio();
+var taps = ['touchend', 'click', 'keydown'];
+for (var t = 0; t < taps.length; t++) window.addEventListener(taps[t], onTap, true);
+}
+}
+Object.defineProperty(media, 'volume', {
+configurable: true,
+enumerable: volumeDescriptor.enumerable,
+get: function () {
+return gameVolume(this);
+},
+set: function (value) {
+var volume;
+try {
+volume = checkedVolume(value);
+} catch (error) {
+if (spare) throw error;
+setVolume.call(this, value);
+volume = getVolume.call(this);
+}
+try {
+gameVolumes.set(this, volume);
+applyVolume(this);
+} catch (e) {}
+}
+});
+var play = media.play;
+if (typeof play === 'function') {
+media.play = function () {
+try {
+track(this);
+} catch (e) {}
+return play.apply(this, arguments);
+};
+}
+listen(document);
+var sources = ['src', 'srcObject', 'autoplay'];
+for (var i = 0; i < sources.length; i++) {
+(function (name) {
+var descriptor = Object.getOwnPropertyDescriptor(media, name);
+if (!descriptor || !descriptor.set || !descriptor.configurable) return;
+Object.defineProperty(media, name, {
+configurable: true,
+enumerable: descriptor.enumerable,
+get: descriptor.get,
+set: function (value) {
+if (own) {
+try {
+if (name === 'src') prepareSource(this, value);
+if (name === 'srcObject') own.readable.delete(this);
+} catch (e) {}
+}
+descriptor.set.call(this, value);
+try {
+listen(this);
+} catch (e) {}
+}
+});
+})(sources[i]);
+}
+var elementProto = window.Element && window.Element.prototype;
+var attachShadow = elementProto && elementProto.attachShadow;
+if (typeof attachShadow === 'function') {
+elementProto.attachShadow = function () {
+var root = attachShadow.apply(this, arguments);
+try {
+listen(root);
+} catch (e) {}
+return root;
+};
+}
+}
+window.addEventListener('message', function (event) {
+try {
+var data = event.data;
+if (event.source !== parent || !data || data.action !== 'setVolume' || !data.content) return;
+var volume = data.content.volume;
+if (typeof volume !== 'number' || volume !== volume) return;
+master = Math.min(1, Math.max(0, volume));
+applyMaster();
+} catch (e) {}
+});
+} catch (e) {}
+})();</script>
+	<script src="https://storage.googleapis.com/rosebud_staticfiles/ScriptsLoader-Universal.js?v=c26350c252c2"></script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+    <meta name="theme-color" content="#0b0b0e" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Pocket Pong" />
+    <meta name="format-detection" content="telephone=no" />
+    <title>Pocket Pong · SAMIX</title>
+    <link rel="icon" type="image/png" href="assets/favicon.png" />
+    <link rel="apple-touch-icon" href="assets/apple-touch-icon.png" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="preload" as="image" href="assets/samix-logo.png" />
+
+    <!-- Critical CSS: the SAMIX loading screen must look right even before styles.css arrives -->
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0b0e; }
+      #splash {
+        position: fixed; inset: 0; z-index: 1000; background: #000; color: #f5f5f7;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+      }
+    </style>
+
+    <!-- Inter is only used on non-Apple devices; loaded without blocking the first paint -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
+    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"></noscript>
+    <link rel="stylesheet" href="styles.css">
+    <script type="importmap">
+      {
+        "imports": {
+          "phaser": "https://esm.sh/phaser@3.70.0",
+          "tone": "https://esm.sh/tone@14.7.77"
+        }
+      }
+    </script>
+  </head>
+  <body>
+
+    <!-- ── SAMIX loading screen ── shown only until the game reports "ready" ── -->
+    <div id="splash" role="status" aria-live="polite" aria-label="Loading">
+      <div class="splash-inner">
+        <img class="splash-logo" src="assets/samix-logo.png" alt="SAMIX" width="460" height="460" decoding="async" fetchpriority="high" />
+        <p class="splash-tagline">GAMES · APPS · INNOVATION</p>
+        <div class="splash-progress" aria-hidden="true"><span></span></div>
+        <div class="splash-error" id="splash-error" hidden>
+          <p class="splash-error-title" id="splash-error-title"></p>
+          <p class="splash-error-text" id="splash-error-text"></p>
+          <button type="button" class="btn btn-primary splash-retry" id="splash-retry"></button>
+        </div>
+      </div>
+      <p class="splash-credit">CREATED BY SAMI</p>
+    </div>
+
+    <!-- Plain script on purpose: it must keep working even if the game modules fail to load -->
+    <script>
+      (function () {
+        var splash = document.getElementById('splash');
+        var errBox = document.getElementById('splash-error');
+        var errTitle = document.getElementById('splash-error-title');
+        var errText = document.getElementById('splash-error-text');
+        var retry = document.getElementById('splash-retry');
+        var lang = String(navigator.language || 'en').toLowerCase().slice(0, 2);
+        var T = {
+          en: {
+            fail: 'Couldn’t load the game',
+            failText: 'Please check your internet connection and try again.',
+            slow: 'Taking longer than usual',
+            slowText: 'Your connection seems slow. The game keeps loading – or you can reload.',
+            retry: 'Reload'
+          },
+          de: {
+            fail: 'Spiel konnte nicht geladen werden',
+            failText: 'Bitte prüfe deine Internetverbindung und versuche es erneut.',
+            slow: 'Das Laden dauert länger als üblich',
+            slowText: 'Deine Verbindung scheint langsam zu sein. Das Spiel lädt weiter – oder du lädst neu.',
+            retry: 'Neu laden'
+          }
+        };
+        var t = T[lang] || T.en;
+        var isReady = false;
+        var slowTimer = null;
+
+        function showMessage(kind) {
+          if (isReady || !splash) return;
+          splash.classList.toggle('is-error', kind === 'fail');
+          splash.classList.add('has-message');
+          errTitle.textContent = kind === 'fail' ? t.fail : t.slow;
+          errText.textContent = kind === 'fail' ? t.failText : t.slowText;
+          retry.textContent = t.retry;
+          errBox.hidden = false;
+        }
+
+        function ready() {
+          if (isReady) return;
+          isReady = true;
+          clearTimeout(slowTimer);
+          document.body.classList.add('app-ready');
+          if (!splash) return;
+          splash.classList.add('is-hidden');
+          var remove = function () { if (splash && splash.parentNode) splash.parentNode.removeChild(splash); splash = null; };
+          splash.addEventListener('transitionend', remove, { once: true });
+          setTimeout(remove, 800);
+        }
+
+        function fail(reason) {
+          if (window.console) console.error('[SAMIX] load failed:', reason);
+          clearTimeout(slowTimer);
+          showMessage('fail');
+        }
+
+        retry.addEventListener('click', function () { window.location.reload(); });
+
+        // Only complain about genuinely slow loads, never delay a fast one.
+        slowTimer = setTimeout(function () { showMessage('slow'); }, 12000);
+
+        // Critical resource errors (the game module or one of its imports)
+        window.addEventListener('error', function (e) {
+          var el = e && e.target;
+          if (el && el.tagName === 'SCRIPT' && /main\.js/.test(el.src || '')) { fail('main.js'); return; }
+          // Runtime errors thrown by our own code or by Phaser while booting
+          if (e && e.filename && (e.filename.indexOf(location.origin) === 0 || e.filename.indexOf('esm.sh') !== -1)) {
+            fail(e.message);
+          }
+        }, true);
+        window.addEventListener('unhandledrejection', function (e) {
+          if (!isReady) fail(e && e.reason);
+        });
+
+        window.SAMIX = { ready: ready, fail: fail };
+      })();
+    </script>
+
+    <div id="game-shell">
+
+      <!-- ── Phaser game (boots behind the start screen) ── -->
+      <div id="game-container"></div>
+
+      <!-- ── Start screen (pure HTML) ── -->
+      <div id="start-screen">
+        <div class="ambient" aria-hidden="true"></div>
+
+        <header class="start-brand">
+          <img class="brand-mark" src="assets/samix-logo.png" alt="SAMIX" width="120" height="120" decoding="async" />
+        </header>
+
+        <main class="start-content" id="start-content">
+          <div class="start-hero" aria-hidden="true">
+            <svg viewBox="0 0 96 96" width="92" height="92">
+              <g transform="rotate(-28 44 48)">
+                <rect x="35" y="58" width="18" height="26" rx="7" fill="#f5f5f7" fill-opacity=".62"/>
+                <circle cx="44" cy="38" r="29" fill="#ff6b62"/>
+                <circle cx="44" cy="38" r="22" fill="none" stroke="#0b0b0e" stroke-opacity=".22" stroke-width="2.5"/>
+                <ellipse cx="34" cy="27" rx="9" ry="5.5" fill="#fff" fill-opacity=".22" transform="rotate(-30 34 27)"/>
+              </g>
+              <circle cx="79" cy="21" r="8" fill="#f5f5f7"/>
+            </svg>
+          </div>
+          <h1 class="start-title">Pocket Pong</h1>
+          <p class="start-tagline">Swipe to hit · First to 7 wins</p>
+
+          <div id="start-menu-panel" class="start-menu-panel">
+            <button id="start-btn" class="btn btn-primary" type="button">Play vs AI</button>
+          </div>
+
+          <section id="difficulty-panel" class="difficulty-panel hidden" aria-live="polite" aria-labelledby="difficulty-title">
+            <div class="difficulty-header">
+              <button id="difficulty-back-btn" class="back-btn" type="button" aria-label="Back to menu">
+                <svg viewBox="0 0 12 20" width="10" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 2 2 10l8 8"/></svg>
+                <span>Back</span>
+              </button>
+              <h2 id="difficulty-title" class="difficulty-title">Difficulty</h2>
+              <span class="difficulty-header-spacer" aria-hidden="true"></span>
+            </div>
+            <div id="difficulty-slider-labels" class="segmented" role="radiogroup" aria-label="Difficulty"></div>
+            <p id="difficulty-hint" class="difficulty-hint"></p>
+            <button id="difficulty-confirm-btn" class="btn btn-primary difficulty-confirm-btn" type="button">Start Match</button>
+          </section>
+        </main>
+
+        <footer class="start-footer">CREATED BY SAMI</footer>
+      </div>
+
+      <!-- ── In-game pause button ── -->
+      <button id="pause-btn" class="pause-btn" type="button" aria-label="Pause game" tabindex="-1">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3" y="2" width="3.4" height="12" rx="1.2"/><rect x="9.6" y="2" width="3.4" height="12" rx="1.2"/></svg>
+      </button>
+
+      <!-- ── Countdown overlay (hidden by default) ── -->
+      <div id="countdown-overlay" class="countdown-overlay hidden">
+        <div class="countdown-inner">
+          <div class="countdown-badge" id="countdown-badge">First to 7 wins</div>
+          <div class="countdown-number" id="countdown-number">3</div>
+          <div class="countdown-sub" id="countdown-sub">Get ready</div>
+        </div>
+      </div>
+
+      <!-- ── Pause menu (hidden by default) ── -->
+      <div id="pause-overlay" class="overlay pause-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="pause-title">
+        <div class="sheet">
+          <p class="eyebrow">Match in progress</p>
+          <h2 class="sheet-title" id="pause-title">Paused</h2>
+          <p class="sheet-score sheet-score--small" id="pause-score" aria-label="Current score"></p>
+          <button class="btn btn-primary" id="resume-btn" type="button">Resume</button>
+          <button class="btn btn-secondary" id="restart-btn" type="button">Restart</button>
+          <button class="btn btn-ghost" id="pause-menu-btn" type="button">Main Menu</button>
+        </div>
+      </div>
+
+      <!-- ── Game over (hidden by default) ── -->
+      <div id="game-over-overlay" class="overlay game-over-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="game-over-title">
+        <div class="sheet game-over-banner">
+          <p class="eyebrow" id="game-over-eyebrow">Match over</p>
+          <h2 class="sheet-title game-over-title" id="game-over-title">You Win</h2>
+          <p class="sheet-score game-over-score" id="game-over-score" aria-label="Final score">7 : 3</p>
+          <button class="btn btn-primary" id="play-again-btn" type="button">Play Again</button>
+          <button class="btn btn-secondary" id="main-menu-btn" type="button">Main Menu</button>
+        </div>
+      </div>
+
+      <details id="tuning-panel" style="display:none;">
+        <summary>TUNE</summary>
+        <div id="panel-root"></div>
+      </details>
+
+    </div>
+    <script type="module" src="main.js" onerror="window.SAMIX && window.SAMIX.fail('main.js')"></script>
+    <script src="https://storage.googleapis.com/rosebud_staticfiles/ChatManager.js"></script>
+    <script src="https://storage.googleapis.com/rosebud_staticfiles/ImageGenerator.js"></script>
+    <script src="https://storage.googleapis.com/rosebud_staticfiles/ProgressLogger.js"></script>
+    <script src="https://storage.googleapis.com/rosebud_staticfiles/OGP.js"></script>
+  </body>
+</html>
